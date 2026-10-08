@@ -1,0 +1,159 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ceph-podman-stage-model
+spec:
+  params:
+  - name: MODEL_NAME
+    type: string
+    default: llama-3-1-8b-instruct
+  - name: MODEL_IMAGE
+    type: string
+    default: registry.redhat.io/rhelai1/modelcar-llama-3-1-8b-instruct-quantized-w4a16:1.5
+  - name: MODEL_DIR
+    type: string
+    default: llama-3-1-8b-instruct
+  - name: MODEL_PVC
+    type: string
+    default: model-storage
+  - name: RBD_STORAGE_CLASS
+    type: string
+    default: ocs-storagecluster-ceph-rbd
+  - name: CEPHFS_STORAGE_CLASS
+    type: string
+    default: ocs-storagecluster-cephfs
+  - name: SERVING_RUNTIME
+    type: string
+    default: vllm-runtime
+  - name: GPU_RESOURCE_NAME
+    type: string
+    default: nvidia.com/gpu
+  - name: GPU_COUNT
+    type: string
+    default: '1'
+  - name: CPU_REQUEST
+    type: string
+    default: '4'
+  - name: MEMORY_REQUEST
+    type: string
+    default: 16Gi
+  - name: MIN_STAGING_GIB
+    type: string
+    default: '16'
+  - name: MIN_MODEL_GIB
+    type: string
+    default: '8'
+  workspaces:
+  - name: podman-storage
+    mountPath: /podman-storage
+  results:
+  - name: MODEL_SIZE
+    description: Actual du -sh extracted size
+  - name: MODEL_VALIDATED
+    description: true only after file validation and metadata cleanup
+  volumes:
+  - name: registry-auth
+    secret:
+      secretName: redhat-registry-auth
+      items:
+      - key: .dockerconfigjson
+        path: config.json
+  - name: permanent-models
+    persistentVolumeClaim:
+      claimName: $(params.MODEL_PVC)
+  steps:
+  - name: extract
+    image: registry.redhat.io/rhel9/podman:latest
+    securityContext:
+      privileged: true
+      runAsUser: 0
+      allowPrivilegeEscalation: true
+    env:
+    - name: MODEL_IMAGE
+      value: $(params.MODEL_IMAGE)
+    - name: MODEL_DIR
+      value: $(params.MODEL_DIR)
+    - name: MIN_STAGING_GIB
+      value: $(params.MIN_STAGING_GIB)
+    - name: MIN_MODEL_GIB
+      value: $(params.MIN_MODEL_GIB)
+    - name: RESULT_SIZE
+      value: $(results.MODEL_SIZE.path)
+    - name: RESULT_VALIDATED
+      value: $(results.MODEL_VALIDATED.path)
+    - name: STAGING_PVC
+      value: $(workspaces.podman-storage.claim)
+    - name: NAMESPACE
+      value: $(context.taskRun.namespace)
+    script: "#!/bin/bash\nset -euo pipefail\n# Parameters are environment values,\
+      \ never interpolated into shell source.\n[[ \"$MODEL_DIR\" =~ ^[a-z0-9][a-z0-9-]{0,62}$\
+      \ ]] || { echo 'Invalid model directory'; exit 1; }\ntest -s /auth/config.json\
+      \ || { echo 'Missing mounted registry auth file'; exit 1; }\nmountpoint -q /podman-storage\
+      \ || { echo 'Staging PVC is not mounted'; exit 1; }\nmountpoint -q /models ||\
+      \ { echo 'Permanent PVC is not mounted'; exit 1; }\n# The extraction Task has\
+      \ only the Podman outer step image. Query PVC status\n# with curl rather than\
+      \ pulling a second utility image into this Task pod.\ncommand -v curl >/dev/null\
+      \ || { echo 'Podman runtime image must include curl'; exit 1; }\n[[ \"$STAGING_PVC\"\
+      \ =~ ^[a-z0-9][a-z0-9-]*$ && \"$NAMESPACE\" =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit\
+      \ 1\nPVC_JSON=$(printf 'Authorization: Bearer %s\\n' \"$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\"\
+      \ |\n    curl --fail --silent --show-error --max-time 30 \\\n      --cacert\
+      \ /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \\\n      --header @-\
+      \ \"https://kubernetes.default.svc/api/v1/namespaces/$NAMESPACE/persistentvolumeclaims/$STAGING_PVC\"\
+      )\ngrep -Eq '\"phase\"[[:space:]]*:[[:space:]]*\"Bound\"' <<< \"$PVC_JSON\"\
+      \ || { echo 'RBD staging PVC not Bound'; exit 1; }\necho \"Staging PVC $STAGING_PVC\
+      \ is Bound\"\n[[ ! -e \"/models/$MODEL_DIR\" && ! -L \"/models/$MODEL_DIR\"\
+      \ ]] || { echo 'Destination exists; refusing overwrite, including incomplete\
+      \ models'; exit 1; }\nWRITE_TEST=$(mktemp /models/.write-test.XXXXXX)\nls -ln\
+      \ \"$WRITE_TEST\"\nrm \"$WRITE_TEST\"\n# Check capacity before downloading;\
+      \ bounds are admin-configured estimates.\nfor pair in \"/podman-storage:$MIN_STAGING_GIB\"\
+      \ \"/models:$MIN_MODEL_GIB\"; do\n    path=${pair%:*}; minimum=${pair##*:}\n\
+      \    [[ \"$minimum\" =~ ^[1-9][0-9]*$ ]] || exit 1\n    available=$(df -Pk \"\
+      $path\" | awk 'NR==2 {print $4}')\n    (( available >= minimum * 1024 * 1024\
+      \ )) || { echo \"Insufficient free capacity on $path; require ${minimum}GiB\"\
+      ; exit 1; }\ndone\nmkdir -p /podman-storage/{root,run,tmp}\nexport TMPDIR=/podman-storage/tmp\n\
+      # Isolate configuration as well as flags: no inherited imagestore/additional\
+      \ stores.\nexport CONTAINERS_STORAGE_CONF=/podman-storage/storage.conf\ncat\
+      \ > \"$CONTAINERS_STORAGE_CONF\" <<'CONF'\n[storage]\ndriver = \"overlay\"\n\
+      graphroot = \"/podman-storage/root\"\nrunroot = \"/podman-storage/run\"\n[storage.options]\n\
+      additionalimagestores = []\nCONF\np() {\n    podman --remote=false --root /podman-storage/root\
+      \ \\\n      --runroot /podman-storage/run --storage-driver=overlay \\\n    \
+      \  --tmpdir /podman-storage/tmp/libpod --events-backend=file \\\n      --cgroup-manager=cgroupfs\
+      \ \"$@\"\n}\nCID=''\ncleanup() {\n    status=$?\n    trap - EXIT\n    if [[\
+      \ -n \"$CID\" ]]; then\n        p rm \"$CID\" || echo 'WARNING: container metadata\
+      \ cleanup failed; retain staging for investigation'\n    fi\n    # Never remove\
+      \ destination files or staging layers on failure.\n    exit \"$status\"\n}\n\
+      trap cleanup EXIT\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\npodman --version\n\
+      df -h /podman-storage /models\np info\nGRAPHROOT=$(p info --format '{{.Store.GraphRoot}}')\n\
+      RUNROOT=$(p info --format '{{.Store.RunRoot}}')\nCOPYTMP=$(p info --format '{{.Store.ImageCopyTmpDir}}')\n\
+      echo \"GraphRoot=$GRAPHROOT RunRoot=$RUNROOT TMPDIR=$TMPDIR ImageCopyTmpDir=$COPYTMP\"\
+      \n[[ \"$(realpath \"$GRAPHROOT\")\" == /podman-storage/root ]] || { echo 'GraphRoot\
+      \ not on staging PVC'; exit 1; }\n[[ \"$(realpath \"$RUNROOT\")\" == /podman-storage/run\
+      \ ]] || { echo 'RunRoot not on staging PVC'; exit 1; }\n[[ \"$TMPDIR\" == /podman-storage/tmp\
+      \ && \"$(realpath \"$COPYTMP\")\" == /podman-storage/tmp ]] || { echo 'Download\
+      \ temporary storage not on staging PVC'; exit 1; }\n# Atomic directory creation\
+      \ reserves the destination across concurrent runs.\n# Failure leaves it intact\
+      \ for administrator inspection; no automatic refresh.\nmkdir \"/models/$MODEL_DIR\"\
+      \np pull --authfile /auth/config.json \"$MODEL_IMAGE\"\np images\ndf -h /podman-storage\n\
+      du -sh /podman-storage/* || true\n# The ModelCar never starts. No Kubernetes\
+      \ container uses this image.\nCID=$(p create --pull=never --network=none \"\
+      $MODEL_IMAGE\")\necho \"Stopped container: $CID\"\np ps -a\np cp \"${CID}:/models/.\"\
+      \ \"/models/${MODEL_DIR}/\"\nchmod -R a+rX \"/models/$MODEL_DIR\"\nsync\ntest\
+      \ -s \"/models/$MODEL_DIR/config.json\"\n[[ -s \"/models/$MODEL_DIR/tokenizer.json\"\
+      \ || -s \"/models/$MODEL_DIR/tokenizer.model\" ]] || { echo 'No nonempty tokenizer';\
+      \ exit 1; }\nWEIGHTS=$(find \"/models/$MODEL_DIR\" -maxdepth 1 -type f -name\
+      \ '*.safetensors' -size +0c -print)\n[[ -n \"$WEIGHTS\" ]] || { echo 'No nonempty\
+      \ safetensors'; exit 1; }\ndu -sh \"/models/$MODEL_DIR\"\nfind \"/models/$MODEL_DIR\"\
+      \ -maxdepth 1 -type f -printf '%f\\n' | sort\nfind \"/models/$MODEL_DIR\" -maxdepth\
+      \ 1 -name '*.safetensors' -printf '%f\\n' | sort\nls -lah \"/models/$MODEL_DIR\"\
+      \n# Results are written only after validation and successful metadata removal.\n\
+      FINAL_CID=\"$CID\"\nCID=''\np rm \"$FINAL_CID\" || { echo 'WARNING: container\
+      \ metadata cleanup failed; retain staging for investigation'; exit 1; }\ndu\
+      \ -sh \"/models/$MODEL_DIR\" | awk '{printf \"%s\",$1}' > \"$RESULT_SIZE\"\n\
+      printf true > \"$RESULT_VALIDATED\"\necho 'Extraction validated. Permanent model\
+      \ retained; staging PVC may be cleaned after Task termination.'\n"
+    volumeMounts:
+    - name: registry-auth
+      mountPath: /auth
+      readOnly: true
+    - name: permanent-models
+      mountPath: /models

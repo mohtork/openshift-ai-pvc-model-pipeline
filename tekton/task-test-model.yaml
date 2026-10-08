@@ -1,0 +1,208 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ceph-test-model
+spec:
+  params:
+  - name: MODEL_NAME
+    type: string
+    default: llama-3-1-8b-instruct
+  - name: MODEL_IMAGE
+    type: string
+    default: registry.redhat.io/rhelai1/modelcar-llama-3-1-8b-instruct-quantized-w4a16:1.5
+  - name: MODEL_DIR
+    type: string
+    default: llama-3-1-8b-instruct
+  - name: MODEL_PVC
+    type: string
+    default: model-storage
+  - name: RBD_STORAGE_CLASS
+    type: string
+    default: ocs-storagecluster-ceph-rbd
+  - name: CEPHFS_STORAGE_CLASS
+    type: string
+    default: ocs-storagecluster-cephfs
+  - name: SERVING_RUNTIME
+    type: string
+    default: vllm-runtime
+  - name: GPU_RESOURCE_NAME
+    type: string
+    default: nvidia.com/gpu
+  - name: GPU_COUNT
+    type: string
+    default: '1'
+  - name: CPU_REQUEST
+    type: string
+    default: '4'
+  - name: MEMORY_REQUEST
+    type: string
+    default: 16Gi
+  - name: READY_TIMEOUT_SECONDS
+    type: string
+    default: '1800'
+  - name: INFERENCE_URL
+    type: string
+    default: ''
+  results:
+  - name: READY
+  - name: STARTUP_SECONDS
+  - name: PREDICTOR_POD
+  - name: GPU_NODE
+  volumes:
+  - name: catalog
+    configMap:
+      name: approved-models
+  steps:
+  - name: test
+    image: registry.access.redhat.com/ubi9/python-312:latest
+    command:
+    - python3
+    args:
+    - -c
+    - "\"\"\"Embedded in Tekton Python steps. Only Kubernetes service-account auth\
+      \ is used.\"\"\"\nimport json\nimport os\nimport re\nimport ssl\nimport time\n\
+      import urllib.error\nimport urllib.request\nfrom pathlib import Path\n\nNS =\
+      \ os.environ['NAMESPACE']\nSA = Path('/var/run/secrets/kubernetes.io/serviceaccount')\n\
+      CA = ssl.create_default_context(cafile=str(SA / 'ca.crt'))\nBASE = f'/apis/serving.kserve.io/v1beta1/namespaces/{NS}/inferenceservices'\n\
+      \n\ndef api(path, body=None):\n    request = urllib.request.Request('https://kubernetes.default.svc'\
+      \ + path,\n        data=None if body is None else json.dumps(body).encode(),\n\
+      \        headers={'Authorization': 'Bearer ' + (SA / 'token').read_text().strip(),\n\
+      \                 'Content-Type': 'application/json'})\n    with urllib.request.urlopen(request,\
+      \ context=CA, timeout=30) as response:\n        return json.load(response)\n\
+      \n\ndef absent(path):\n    try:\n        api(path)\n    except urllib.error.HTTPError\
+      \ as error:\n        if error.code == 404:\n            return\n        raise\n\
+      \    raise RuntimeError('Existing deployment; refusing overwrite')\n\n\ndef\
+      \ valid_name(value):\n    if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',\
+      \ value):\n        raise RuntimeError('Invalid Kubernetes name/directory')\n\
+      \n\ndef approved():\n    # Administrator-owned catalog; a submitted image alone\
+      \ cannot override policy.\n    catalog = json.loads(Path('/catalog/approved.json').read_text())\n\
+      \    entry = catalog.get(os.environ['MODEL_NAME'])\n    if not entry:\n    \
+      \    raise RuntimeError('Model not approved')\n    for key, expected in entry.items():\n\
+      \        if os.environ.get(key) != str(expected):\n            raise RuntimeError(f'Parameter\
+      \ {key} differs from administrator catalog')\n    for key in ('MODEL_NAME',\
+      \ 'MODEL_DIR', 'MODEL_PVC', 'SERVING_RUNTIME'):\n        valid_name(os.environ[key])\n\
+      \n\ndef pvc(name, sc, mode):\n    obj = api(f'/api/v1/namespaces/{NS}/persistentvolumeclaims/{name}')\n\
+      \    if obj['status'].get('phase') != 'Bound':\n        raise RuntimeError(f'PVC\
+      \ {name} not Bound')\n    spec = obj['spec']\n    if spec.get('storageClassName')\
+      \ != sc or mode not in spec['accessModes'] or spec.get('volumeMode', 'Filesystem')\
+      \ != 'Filesystem':\n        raise RuntimeError(f'PVC {name} class/access/volume\
+      \ mode mismatch')\n    print(f'PVC {name}: Bound, {sc}, {mode}', flush=True)\n\
+      \n\ndef main():\n    action = os.environ['ACTION']\n    approved()\n    model\
+      \ = os.environ['MODEL_NAME']\n    if action in ('validate', 'bound'):\n    \
+      \    pvc(os.environ['MODEL_PVC'], os.environ['CEPHFS_STORAGE_CLASS'], 'ReadWriteMany')\n\
+      \        auth = json.loads(Path('/auth/config.json').read_text())\n        if\
+      \ not auth.get('auths'):\n            raise RuntimeError('Registry auth file\
+      \ has no auths; contents suppressed')\n        if action == 'bound':\n     \
+      \       # This step runs in the extraction pod after its workspace is mounted.\n\
+      \            pvc(os.environ['STAGING_PVC'], os.environ['RBD_STORAGE_CLASS'],\
+      \ 'ReadWriteOnce')\n        else:\n            api(f'/apis/serving.kserve.io/v1alpha1/namespaces/{NS}/servingruntimes/'\
+      \ + os.environ['SERVING_RUNTIME'])\n            absent(BASE + '/' + model)\n\
+      \        return\n    if action == 'deploy':\n        absent(BASE + '/' + model)\n\
+      \        resource = os.environ['GPU_RESOURCE_NAME']\n        quantity = {'cpu':\
+      \ os.environ['CPU_REQUEST'], 'memory': os.environ['MEMORY_REQUEST'], resource:\
+      \ os.environ['GPU_COUNT']}\n        predictor = {'minReplicas': 1, 'maxReplicas':\
+      \ 1, 'model': {\n            'modelFormat': {'name': 'vLLM'}, 'runtime': os.environ['SERVING_RUNTIME'],\n\
+      \            'storageUri': f\"pvc://{os.environ['MODEL_PVC']}/{os.environ['MODEL_DIR']}/\"\
+      ,\n            'resources': {'requests': quantity, 'limits': quantity}}}\n \
+      \       # Predictor deliberately does not use the privileged extraction account.\n\
+      \        annotations = {}\n        if os.environ.get('DEPLOYMENT_MODE'):\n \
+      \           annotations['serving.kserve.io/deploymentMode'] = os.environ['DEPLOYMENT_MODE']\n\
+      \        api(BASE, {'apiVersion': 'serving.kserve.io/v1beta1', 'kind': 'InferenceService',\n\
+      \            'metadata': {'name': model, 'annotations': annotations,\n     \
+      \                    'labels': {'opendatahub.io/dashboard': 'true'}},\n    \
+      \        'spec': {'predictor': predictor}})\n        print('Created model with\
+      \ permanent CephFS PVC URI', flush=True)\n        return\n    if action != 'test':\n\
+      \        raise RuntimeError('Unknown task action')\n    started = time.monotonic()\n\
+      \    deadline = started + int(os.environ['READY_TIMEOUT_SECONDS'])\n    while\
+      \ time.monotonic() < deadline:\n        service = api(BASE + '/' + model)\n\
+      \        conditions = service.get('status', {}).get('conditions', [])\n    \
+      \    if any(c['type'] == 'Ready' and c['status'] == 'True' for c in conditions):\n\
+      \            break\n        print('Waiting for KServe readiness', flush=True)\n\
+      \        time.sleep(10)\n    else:\n        raise RuntimeError('KServe readiness\
+      \ timeout')\n    elapsed = round(time.monotonic() - started)\n    pods = api(f'/api/v1/namespaces/{NS}/pods?labelSelector=serving.kserve.io%2Finferenceservice%3D{model}')['items']\n\
+      \    ready_pods = [p for p in pods if p['status'].get('phase') == 'Running'\
+      \ and any(c['type'] == 'Ready' and c['status'] == 'True' for c in p['status'].get('conditions',\
+      \ []))]\n    if not ready_pods:\n        raise RuntimeError('No ready predictor\
+      \ pod')\n    pod = ready_pods[0]\n    gpu = os.environ['GPU_RESOURCE_NAME']\n\
+      \    if not any(str(c.get('resources', {}).get('limits', {}).get(gpu)) == os.environ['GPU_COUNT']\
+      \ for c in pod['spec']['containers']):\n        raise RuntimeError('Predictor\
+      \ GPU allocation mismatch')\n    endpoint = os.environ.get('INFERENCE_URL')\
+      \ or f'http://{model}-predictor.{NS}.svc.cluster.local:8080'\n\n    # KServe\
+      \ can report Ready a few seconds before the cluster Service endpoint is\n  \
+      \  # consistently reachable from another pod. Retry the API call until the same\n\
+      \    # readiness deadline instead of failing the PipelineRun on the first transient\n\
+      \    # connection timeout/refusal.\n    def inference(path, body=None):\n  \
+      \      url = endpoint.rstrip('/') + path\n        attempt = 0\n        while\
+      \ True:\n            attempt += 1\n            remaining = deadline - time.monotonic()\n\
+      \            if remaining <= 0:\n                raise RuntimeError(f'Inference\
+      \ endpoint did not become reachable: {path}')\n            req = urllib.request.Request(url,\n\
+      \                data=None if body is None else json.dumps(body).encode(),\n\
+      \                headers={'Content-Type': 'application/json'})\n           \
+      \ try:\n                with urllib.request.urlopen(req, timeout=min(30, max(1,\
+      \ remaining))) as response:\n                    return json.load(response)\n\
+      \            except urllib.error.HTTPError as error:\n                if error.code\
+      \ not in (408, 429, 500, 502, 503, 504):\n                    raise\n      \
+      \          detail = f'HTTP {error.code}'\n            except (urllib.error.URLError,\
+      \ TimeoutError, ConnectionError) as error:\n                detail = type(error).__name__\n\
+      \            print(f'Inference endpoint not ready ({path}, attempt {attempt},\
+      \ {detail}); retrying', flush=True)\n            time.sleep(min(10, max(1, deadline\
+      \ - time.monotonic())))\n\n    listing = inference('/v1/models')\n    if not\
+      \ any(m.get('id') == model for m in listing.get('data', [])):\n        raise\
+      \ RuntimeError('Expected model absent from /v1/models')\n    answer = inference('/v1/chat/completions',\
+      \ {'model': model, 'messages': [\n        {'role': 'user', 'content': 'What\
+      \ is the capital of Ireland? Answer in one sentence.'}],\n        'temperature':\
+      \ 0, 'max_tokens': 64})\n    content = answer['choices'][0]['message']['content']\n\
+      \    if not isinstance(content, str) or not content.strip():\n        raise\
+      \ RuntimeError('Empty inference answer')\n    print(json.dumps({'ready': True,\
+      \ 'startup_seconds': elapsed, 'pod': pod['metadata']['name'],\n        'node':\
+      \ pod['spec']['nodeName'], 'gpu_resource': gpu, 'answer': content}), flush=True)\n\
+      \    for env, value in [('RESULT_READY', 'true'), ('RESULT_STARTUP', str(elapsed)),\n\
+      \                       ('RESULT_POD', pod['metadata']['name']), ('RESULT_NODE',\
+      \ pod['spec']['nodeName'])]:\n        Path(os.environ[env]).write_text(value)\n\
+      \n\nif __name__ == '__main__':\n    try:\n        main()\n    except urllib.error.HTTPError\
+      \ as error:\n        # Never print request headers or authentication response\
+      \ bodies.\n        raise SystemExit(f'HTTP failure {error.code}; check resource\
+      \ status and operator logs')\n"
+    env:
+    - name: MODEL_NAME
+      value: $(params.MODEL_NAME)
+    - name: MODEL_IMAGE
+      value: $(params.MODEL_IMAGE)
+    - name: MODEL_DIR
+      value: $(params.MODEL_DIR)
+    - name: MODEL_PVC
+      value: $(params.MODEL_PVC)
+    - name: RBD_STORAGE_CLASS
+      value: $(params.RBD_STORAGE_CLASS)
+    - name: CEPHFS_STORAGE_CLASS
+      value: $(params.CEPHFS_STORAGE_CLASS)
+    - name: SERVING_RUNTIME
+      value: $(params.SERVING_RUNTIME)
+    - name: GPU_RESOURCE_NAME
+      value: $(params.GPU_RESOURCE_NAME)
+    - name: GPU_COUNT
+      value: $(params.GPU_COUNT)
+    - name: CPU_REQUEST
+      value: $(params.CPU_REQUEST)
+    - name: MEMORY_REQUEST
+      value: $(params.MEMORY_REQUEST)
+    - name: NAMESPACE
+      value: $(context.taskRun.namespace)
+    - name: ACTION
+      value: test
+    - name: READY_TIMEOUT_SECONDS
+      value: $(params.READY_TIMEOUT_SECONDS)
+    - name: INFERENCE_URL
+      value: $(params.INFERENCE_URL)
+    - name: RESULT_READY
+      value: $(results.READY.path)
+    - name: RESULT_STARTUP
+      value: $(results.STARTUP_SECONDS.path)
+    - name: RESULT_POD
+      value: $(results.PREDICTOR_POD.path)
+    - name: RESULT_NODE
+      value: $(results.GPU_NODE.path)
+    volumeMounts:
+    - name: catalog
+      mountPath: /catalog
+      readOnly: true

@@ -1,0 +1,19 @@
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: vllm-runtime
+spec:
+  multiModel: false
+  supportedModelFormats:
+  - name: vLLM
+    autoSelect: true
+  containers:
+  - name: kserve-container
+    image: registry.redhat.io/rhoai/odh-vllm-cuda-rhel9@sha256:46cffdeb70009f8f901e0dc658c8c499a5d2b4bbcea343741d7d7fda2a12b9b2
+    args:
+    - --port=8080
+    - --model=/mnt/models
+    - --served-model-name={{.Name}}
+    ports:
+    - containerPort: 8080
+      protocol: TCP

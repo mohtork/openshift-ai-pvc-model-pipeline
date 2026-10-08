@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: approved-models
+data:
+  approved.json: "{\n  \"llama-3-1-8b-instruct\": {\n    \"MODEL_NAME\": \"llama-3-1-8b-instruct\"\
+    ,\n    \"MODEL_IMAGE\": \"registry.redhat.io/rhelai1/modelcar-llama-3-1-8b-instruct-quantized-w4a16:1.5\"\
+    ,\n    \"MODEL_DIR\": \"llama-3-1-8b-instruct\",\n    \"MODEL_PVC\": \"model-storage\"\
+    ,\n    \"RBD_STORAGE_CLASS\": \"ocs-storagecluster-ceph-rbd\",\n    \"CEPHFS_STORAGE_CLASS\"\
+    : \"ocs-storagecluster-cephfs\",\n    \"SERVING_RUNTIME\": \"vllm-runtime\",\n\
+    \    \"GPU_RESOURCE_NAME\": \"nvidia.com/gpu\",\n    \"GPU_COUNT\": \"1\",\n \
+    \   \"CPU_REQUEST\": \"4\",\n    \"MEMORY_REQUEST\": \"16Gi\"\n  }\n}"

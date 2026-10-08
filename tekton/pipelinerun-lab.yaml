@@ -1,0 +1,72 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: ceph-llama-
+  namespace: rag-tekton-lab
+  annotations:
+    ceph-model-evaluation/template-only: Render with scripts/admin-lab.sh; discover
+      namespace fsGroup before deployment
+spec:
+  pipelineRef:
+    name: ceph-model-evaluation
+  taskRunTemplate:
+    serviceAccountName: rag-model-pipeline
+  taskRunSpecs:
+  - pipelineTaskName: extract-model
+    serviceAccountName: podman-model-extractor
+    podTemplate:
+      securityContext:
+        fsGroup: __NAMESPACE_FSGROUP__
+        fsGroupChangePolicy: OnRootMismatch
+  params:
+  - name: MODEL_NAME
+    value: llama-3-1-8b-instruct
+  - name: MODEL_IMAGE
+    value: registry.redhat.io/rhelai1/modelcar-llama-3-1-8b-instruct-quantized-w4a16:1.5
+  - name: MODEL_DIR
+    value: llama-3-1-8b-instruct
+  - name: MODEL_PVC
+    value: model-storage
+  - name: RBD_STORAGE_CLASS
+    value: ocs-storagecluster-ceph-rbd
+  - name: CEPHFS_STORAGE_CLASS
+    value: ocs-storagecluster-cephfs
+  - name: SERVING_RUNTIME
+    value: vllm-runtime
+  - name: GPU_RESOURCE_NAME
+    value: nvidia.com/gpu
+  - name: GPU_COUNT
+    value: '1'
+  - name: CPU_REQUEST
+    value: '4'
+  - name: MEMORY_REQUEST
+    value: 16Gi
+  - name: STAGING_SIZE
+    value: 20Gi
+  - name: MIN_STAGING_GIB
+    value: '16'
+  - name: MIN_MODEL_GIB
+    value: '8'
+  - name: DEPLOYMENT_MODE
+    value: ''
+  - name: READY_TIMEOUT_SECONDS
+    value: '1800'
+  - name: INFERENCE_URL
+    value: ''
+  workspaces:
+  - name: podman-storage
+    volumeClaimTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/part-of: ceph-model-evaluation
+          model-storage-role: temporary-podman
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        volumeMode: Filesystem
+        storageClassName: ocs-storagecluster-ceph-rbd
+        resources:
+          requests:
+            storage: 20Gi
+  timeouts:
+    pipeline: 90m

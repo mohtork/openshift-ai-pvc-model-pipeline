@@ -1,0 +1,196 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: ceph-model-evaluation
+spec:
+  params:
+  - name: MODEL_NAME
+    type: string
+    default: llama-3-1-8b-instruct
+  - name: MODEL_IMAGE
+    type: string
+    default: registry.redhat.io/rhelai1/modelcar-llama-3-1-8b-instruct-quantized-w4a16:1.5
+  - name: MODEL_DIR
+    type: string
+    default: llama-3-1-8b-instruct
+  - name: MODEL_PVC
+    type: string
+    default: model-storage
+  - name: RBD_STORAGE_CLASS
+    type: string
+    default: ocs-storagecluster-ceph-rbd
+  - name: CEPHFS_STORAGE_CLASS
+    type: string
+    default: ocs-storagecluster-cephfs
+  - name: SERVING_RUNTIME
+    type: string
+    default: vllm-runtime
+  - name: GPU_RESOURCE_NAME
+    type: string
+    default: nvidia.com/gpu
+  - name: GPU_COUNT
+    type: string
+    default: '1'
+  - name: CPU_REQUEST
+    type: string
+    default: '4'
+  - name: MEMORY_REQUEST
+    type: string
+    default: 16Gi
+  - name: STAGING_SIZE
+    type: string
+    default: 20Gi
+  - name: MIN_STAGING_GIB
+    type: string
+    default: '16'
+  - name: MIN_MODEL_GIB
+    type: string
+    default: '8'
+  - name: DEPLOYMENT_MODE
+    type: string
+    default: ''
+  - name: READY_TIMEOUT_SECONDS
+    type: string
+    default: '1800'
+  - name: INFERENCE_URL
+    type: string
+    default: ''
+  workspaces:
+  - name: podman-storage
+  tasks:
+  - name: validate-environment
+    taskRef:
+      name: ceph-validate-environment
+    params:
+    - name: MODEL_NAME
+      value: $(params.MODEL_NAME)
+    - name: MODEL_IMAGE
+      value: $(params.MODEL_IMAGE)
+    - name: MODEL_DIR
+      value: $(params.MODEL_DIR)
+    - name: MODEL_PVC
+      value: $(params.MODEL_PVC)
+    - name: RBD_STORAGE_CLASS
+      value: $(params.RBD_STORAGE_CLASS)
+    - name: CEPHFS_STORAGE_CLASS
+      value: $(params.CEPHFS_STORAGE_CLASS)
+    - name: SERVING_RUNTIME
+      value: $(params.SERVING_RUNTIME)
+    - name: GPU_RESOURCE_NAME
+      value: $(params.GPU_RESOURCE_NAME)
+    - name: GPU_COUNT
+      value: $(params.GPU_COUNT)
+    - name: CPU_REQUEST
+      value: $(params.CPU_REQUEST)
+    - name: MEMORY_REQUEST
+      value: $(params.MEMORY_REQUEST)
+  - name: extract-model
+    taskRef:
+      name: ceph-podman-stage-model
+    params:
+    - name: MODEL_NAME
+      value: $(params.MODEL_NAME)
+    - name: MODEL_IMAGE
+      value: $(params.MODEL_IMAGE)
+    - name: MODEL_DIR
+      value: $(params.MODEL_DIR)
+    - name: MODEL_PVC
+      value: $(params.MODEL_PVC)
+    - name: RBD_STORAGE_CLASS
+      value: $(params.RBD_STORAGE_CLASS)
+    - name: CEPHFS_STORAGE_CLASS
+      value: $(params.CEPHFS_STORAGE_CLASS)
+    - name: SERVING_RUNTIME
+      value: $(params.SERVING_RUNTIME)
+    - name: GPU_RESOURCE_NAME
+      value: $(params.GPU_RESOURCE_NAME)
+    - name: GPU_COUNT
+      value: $(params.GPU_COUNT)
+    - name: CPU_REQUEST
+      value: $(params.CPU_REQUEST)
+    - name: MEMORY_REQUEST
+      value: $(params.MEMORY_REQUEST)
+    - name: MIN_STAGING_GIB
+      value: $(params.MIN_STAGING_GIB)
+    - name: MIN_MODEL_GIB
+      value: $(params.MIN_MODEL_GIB)
+    runAfter:
+    - validate-environment
+    workspaces:
+    - name: podman-storage
+      workspace: podman-storage
+  - name: deploy-model
+    taskRef:
+      name: ceph-deploy-model
+    params:
+    - name: MODEL_NAME
+      value: $(params.MODEL_NAME)
+    - name: MODEL_IMAGE
+      value: $(params.MODEL_IMAGE)
+    - name: MODEL_DIR
+      value: $(params.MODEL_DIR)
+    - name: MODEL_PVC
+      value: $(params.MODEL_PVC)
+    - name: RBD_STORAGE_CLASS
+      value: $(params.RBD_STORAGE_CLASS)
+    - name: CEPHFS_STORAGE_CLASS
+      value: $(params.CEPHFS_STORAGE_CLASS)
+    - name: SERVING_RUNTIME
+      value: $(params.SERVING_RUNTIME)
+    - name: GPU_RESOURCE_NAME
+      value: $(params.GPU_RESOURCE_NAME)
+    - name: GPU_COUNT
+      value: $(params.GPU_COUNT)
+    - name: CPU_REQUEST
+      value: $(params.CPU_REQUEST)
+    - name: MEMORY_REQUEST
+      value: $(params.MEMORY_REQUEST)
+    - name: DEPLOYMENT_MODE
+      value: $(params.DEPLOYMENT_MODE)
+    runAfter:
+    - extract-model
+  - name: wait-and-test
+    taskRef:
+      name: ceph-test-model
+    params:
+    - name: MODEL_NAME
+      value: $(params.MODEL_NAME)
+    - name: MODEL_IMAGE
+      value: $(params.MODEL_IMAGE)
+    - name: MODEL_DIR
+      value: $(params.MODEL_DIR)
+    - name: MODEL_PVC
+      value: $(params.MODEL_PVC)
+    - name: RBD_STORAGE_CLASS
+      value: $(params.RBD_STORAGE_CLASS)
+    - name: CEPHFS_STORAGE_CLASS
+      value: $(params.CEPHFS_STORAGE_CLASS)
+    - name: SERVING_RUNTIME
+      value: $(params.SERVING_RUNTIME)
+    - name: GPU_RESOURCE_NAME
+      value: $(params.GPU_RESOURCE_NAME)
+    - name: GPU_COUNT
+      value: $(params.GPU_COUNT)
+    - name: CPU_REQUEST
+      value: $(params.CPU_REQUEST)
+    - name: MEMORY_REQUEST
+      value: $(params.MEMORY_REQUEST)
+    - name: READY_TIMEOUT_SECONDS
+      value: $(params.READY_TIMEOUT_SECONDS)
+    - name: INFERENCE_URL
+      value: $(params.INFERENCE_URL)
+    runAfter:
+    - deploy-model
+  results:
+  - name: MODEL_SIZE
+    value: $(tasks.extract-model.results.MODEL_SIZE)
+  - name: MODEL_VALIDATED
+    value: $(tasks.extract-model.results.MODEL_VALIDATED)
+  - name: READY
+    value: $(tasks.wait-and-test.results.READY)
+  - name: STARTUP_SECONDS
+    value: $(tasks.wait-and-test.results.STARTUP_SECONDS)
+  - name: PREDICTOR_POD
+    value: $(tasks.wait-and-test.results.PREDICTOR_POD)
+  - name: GPU_NODE
+    value: $(tasks.wait-and-test.results.GPU_NODE)
